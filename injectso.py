@@ -3,8 +3,9 @@ import gdb
 
 """
 	limitations:
-	- no threads support
 	- no TLS support
+	- only RTLD_NOW
+	- no support for __attribute__((constructor)) and __attribute__((destructor))
 """
 
 import os, mmap, cffi
@@ -39,7 +40,7 @@ class SegmentLoader:
 		self.layout = []
 
 	@staticmethod
-	def flags2prot(v):
+	def _flags2prot(v):
 		ret = 0
 		if 0 != (v & SegmentLoader.PF_X):
 			ret |= SegmentLoader.PROT_EXEC
@@ -50,32 +51,31 @@ class SegmentLoader:
 		return ret
 
 	@staticmethod
-	def up2page(addr):
+	def _up2page(addr):
 		return (addr + mmap.PAGESIZE - 1) & -mmap.PAGESIZE
 
 	@staticmethod
-	def down2page(addr):
+	def _down2page(addr):
 		return addr & -mmap.PAGESIZE
 
 	@staticmethod
-	def layout_item_unmapped(s, l):
-		return {"type": "unmapped", "start": s, "length": l, "prot": SegmentLoader.PROT_NONE}
+	def _layout_item_unmmapped(s, l):
+		return {"type": "unmmapped", "start": s, "length": l, "prot": SegmentLoader.PROT_NONE}
 
 	@staticmethod
-	def layout_item_mmaped(p, s, l):
-		return {"type": "mmaped", "start": s, "length": l, "segment": p, "prot": SegmentLoader.flags2prot(p.p_flags)}
+	def _layout_item_mmaped(p, s, l):
+		return {"type": "mmaped", "start": s, "length": l, "segment": p, "prot": SegmentLoader._flags2prot(p.p_flags)}
 
 	@staticmethod
-	def layout_item_anon(s, l, flags):
-		return {"type": "anon", "start": s, "length": l, "prot": SegmentLoader.flags2prot(flags)}
+	def _layout_item_anon(s, l, flags):
+		return {"type": "anon", "start": s, "length": l, "prot": SegmentLoader._flags2prot(flags)}
 
-	def load(self, p):
+	def add_segment(self, p):
 		if (p.p_vaddr & (mmap.PAGESIZE - 1)) != (p.p_offset & (mmap.PAGESIZE - 1)):
 			raise Exception("unaligned p_vaddr and p_offset")
-		# xxx: check if they sorted by vaddr
 		self.segments.append(p)
 
-	def find_equal_or_greater(self, v):
+	def _find_equal_or_greater(self, v):
 		ret = None
 		for p in self.segments:
 			if p.p_vaddr < v:
@@ -84,67 +84,67 @@ class SegmentLoader:
 				ret = p
 		return ret
 
-	def create_layout(self):
+	def _create_layout(self):
 		self.mmap_sz = max(map(lambda p: p.p_vaddr + p.p_memsz, self.segments))
-		end_addr = SegmentLoader.up2page(self.mmap_sz)
+		end_addr = SegmentLoader._up2page(self.mmap_sz)
 		addr = 0
 		while addr < end_addr:
-			p = self.find_equal_or_greater(addr)
-			addr_start = SegmentLoader.down2page(p.p_vaddr)
-			addr_end = SegmentLoader.up2page(p.p_vaddr + p.p_memsz)
-			addr_f_end = SegmentLoader.up2page(p.p_vaddr + p.p_filesz)
+			p = self._find_equal_or_greater(addr)
+			addr_start = SegmentLoader._down2page(p.p_vaddr)
+			addr_end = SegmentLoader._up2page(p.p_vaddr + p.p_memsz)
+			addr_f_end = SegmentLoader._up2page(p.p_vaddr + p.p_filesz)
 
 			if addr < addr_start:
-				# hole in virtual addresses ? insert some unmapped memory
-				self.layout.append(SegmentLoader.layout_item_unmapped(addr, addr_start - addr))
+				# hole in virtual addresses ? insert some unmmapped memory
+				self.layout.append(SegmentLoader._layout_item_unmmapped(addr, addr_start - addr))
 
-			self.layout.append(SegmentLoader.layout_item_mmaped(p, addr_start, addr_f_end - addr_start))
+			self.layout.append(SegmentLoader._layout_item_mmaped(p, addr_start, addr_f_end - addr_start))
 
 			if addr_f_end < addr_end:
 				# the rest is not mapped by file ? this is bss
-				self.layout.append(SegmentLoader.layout_item_anon(addr_f_end, addr_end - addr_f_end, p.p_flags))
+				self.layout.append(SegmentLoader._layout_item_anon(addr_f_end, addr_end - addr_f_end, p.p_flags))
 
 			addr = addr_end
 
 		print self.layout
 
 	@staticmethod
-	def mmap(addr, sz, prot, flags, fd, offset):
+	def _mmap(addr, sz, prot, flags, fd, offset):
 		return long(gdb.parse_and_eval("$mmap()(%lu, %lu, %u, %u, %u, %lu)" % (
 			addr, sz, prot, flags, fd, offset)))
 
 	@staticmethod
-	def mprotect(addr, sz, prot):
+	def _mprotect(addr, sz, prot):
 		return int(gdb.parse_and_eval("mprotect(%lu, %lu, %u)" % (addr, sz, prot)))
 
-	def map(self):
-		self.create_layout()
+	def mmap_file(self):
+		self._create_layout()
 		head = self.layout[0]
 		assert head['type'] == 'mmaped'
 		assert head['segment'].p_offset == 0
-		ret = SegmentLoader.mmap(0, self.mmap_sz, head['prot'], SegmentLoader.MAP_PRIVATE, self.fd, head['segment'].p_offset)
+		ret = SegmentLoader._mmap(0, self.mmap_sz, head['prot'], SegmentLoader.MAP_PRIVATE, self.fd, head['segment'].p_offset)
 		self.base = long(ret)
 		for l in self.layout[1:]:
 			addr = self.base + l['start']
 			if l['type'] == 'mmaped':
-				ret = SegmentLoader.mmap(addr, l['length'], l['prot'],
+				ret = SegmentLoader._mmap(addr, l['length'], l['prot'],
 					SegmentLoader.MAP_PRIVATE | SegmentLoader.MAP_FIXED, self.fd,
-					SegmentLoader.down2page(l['segment'].p_offset))
+					SegmentLoader._down2page(l['segment'].p_offset))
 				assert ret == addr
-			elif l['type'] == 'unmapped':
-				ret = SegmentLoader.mprotect(addr, l['length'], l['prot'])
+			elif l['type'] == 'unmmapped':
+				ret = SegmentLoader._mprotect(addr, l['length'], l['prot'])
 				assert ret == 0
 			elif l['type'] == 'anon':
-				ret = SegmentLoader.mmap(addr, l['length'], l['prot'],
+				ret = SegmentLoader._mmap(addr, l['length'], l['prot'],
 					SegmentLoader.MAP_PRIVATE | SegmentLoader.MAP_FIXED | SegmentLoader.MAP_ANONYMOUS, -1, 0)
 				assert ret == addr
 			else:
 				raise Exception("oops")
 
 	def process_gnu_relro(self, p):
-		addr = SegmentLoader.down2page(p.p_vaddr)
-		sz = SegmentLoader.up2page(p.p_vaddr + p.p_memsz) - addr
-		ret = SegmentLoader.mprotect(self.base + addr, sz, SegmentLoader.PROT_READ)
+		addr = SegmentLoader._down2page(p.p_vaddr)
+		sz = SegmentLoader._up2page(p.p_vaddr + p.p_memsz) - addr
+		ret = SegmentLoader._mprotect(self.base + addr, sz, SegmentLoader.PROT_READ)
 		assert ret == 0
 
 class ElfLoader:
@@ -156,7 +156,7 @@ class ElfLoader:
 		self.ffi.cdef(elf_cdefs)
 		self.size = size
 
-	def read(self, type, offset):
+	def _read(self, type, offset):
 		sz = self.ffi.sizeof(type)
 		self.mh.seek(offset)
 		b = self.mh.read(sz)
@@ -167,21 +167,23 @@ class ElfLoader:
 	def load_so(self):
 		gnu_relro = None
 
-		elf_hdr = self.read("Elf64_Ehdr", 0)
+		elf_hdr = self._read("Elf64_Ehdr", 0)
 
 		for ph in range(elf_hdr.e_phnum):
-			phdr = self.read("Elf64_Phdr", elf_hdr.e_phoff + ph * self.ffi.sizeof("Elf64_Phdr"))
+			phdr = self._read("Elf64_Phdr", elf_hdr.e_phoff + ph * self.ffi.sizeof("Elf64_Phdr"))
 			if phdr.p_type == SegmentLoader.PT_LOAD:
-				self.sl.load(phdr)
+				self.sl.add_segment(phdr)
 			elif phdr.p_type == SegmentLoader.PT_GNU_RELRO:
 				gnu_relro = phdr
 
-		self.sl.map()
+		self.sl.mmap_file()
 
 		# process relocations 
 
 		if gnu_relro is not None:
 			self.sl.process_gnu_relro(gnu_relro)
+
+		# process symbol resolution
 
 class injectso(gdb.Function):
 	def __init__(self):
@@ -190,7 +192,7 @@ class injectso(gdb.Function):
 	def invoke(self, filename):
 		fd = os.open(filename.string(), os.O_RDONLY)
 		s = os.fstat(fd)
-		i_fd = gdb.parse_and_eval("open(\"%s\", 0)" % filename.string())
+		i_fd = int(gdb.parse_and_eval("open(\"%s\", 0)" % filename.string()))
 		assert i_fd >= 0
 		mh = mmap.mmap(fd, s.st_size, mmap.MAP_PRIVATE, mmap.PROT_READ)
 		os.close(fd)
