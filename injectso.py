@@ -51,23 +51,23 @@ class SegmentLoader:
 
 	@staticmethod
 	def up2page(addr):
-		return ((addr + mmap.PAGESIZE - 1) & -mmap.PAGESIZE) / mmap.PAGESIZE
+		return (addr + mmap.PAGESIZE - 1) & -mmap.PAGESIZE
 
 	@staticmethod
 	def down2page(addr):
-		return (addr & -mmap.PAGESIZE) / mmap.PAGESIZE
+		return addr & -mmap.PAGESIZE
 
 	@staticmethod
 	def layout_item_unmapped(s, l):
-		return {"type": "unmapped", "start": s * mmap.PAGESIZE, "length": l * mmap.PAGESIZE, "prot": SegmentLoader.PROT_NONE}
+		return {"type": "unmapped", "start": s, "length": l, "prot": SegmentLoader.PROT_NONE}
 
 	@staticmethod
 	def layout_item_mmaped(p, s, l):
-		return {"type": "mmaped", "start": s * mmap.PAGESIZE, "length": l * mmap.PAGESIZE, "segment": p, "prot": SegmentLoader.flags2prot(p.p_flags)}
+		return {"type": "mmaped", "start": s, "length": l, "segment": p, "prot": SegmentLoader.flags2prot(p.p_flags)}
 
 	@staticmethod
 	def layout_item_anon(s, l, flags):
-		return {"type": "anon", "start": s * mmap.PAGESIZE, "length": l * mmap.PAGESIZE, "prot": SegmentLoader.flags2prot(flags)}
+		return {"type": "anon", "start": s, "length": l, "prot": SegmentLoader.flags2prot(flags)}
 
 	def load(self, p):
 		if (p.p_vaddr & (mmap.PAGESIZE - 1)) != (p.p_offset & (mmap.PAGESIZE - 1)):
@@ -86,25 +86,25 @@ class SegmentLoader:
 
 	def create_layout(self):
 		self.mmap_sz = max(map(lambda p: p.p_vaddr + p.p_memsz, self.segments))
-		end_page = SegmentLoader.up2page(self.mmap_sz)
-		page = 0
-		while page < end_page:
-			p = self.find_equal_or_greater(page * mmap.PAGESIZE)
-			p_start = SegmentLoader.down2page(p.p_vaddr)
-			p_end = SegmentLoader.up2page(p.p_vaddr + p.p_memsz)
-			p_f_end = SegmentLoader.up2page(p.p_vaddr + p.p_filesz)
+		end_addr = SegmentLoader.up2page(self.mmap_sz)
+		addr = 0
+		while addr < end_addr:
+			p = self.find_equal_or_greater(addr)
+			addr_start = SegmentLoader.down2page(p.p_vaddr)
+			addr_end = SegmentLoader.up2page(p.p_vaddr + p.p_memsz)
+			addr_f_end = SegmentLoader.up2page(p.p_vaddr + p.p_filesz)
 
-			if page < p_start:
+			if addr < addr_start:
 				# hole in virtual addresses ? insert some unmapped memory
-				self.layout.append(SegmentLoader.layout_item_unmapped(page, p_start - page))
+				self.layout.append(SegmentLoader.layout_item_unmapped(addr, addr_start - addr))
 
-			self.layout.append(SegmentLoader.layout_item_mmaped(p, p_start, p_f_end - p_start))
+			self.layout.append(SegmentLoader.layout_item_mmaped(p, addr_start, addr_f_end - addr_start))
 
-			if p_f_end < p_end:
+			if addr_f_end < addr_end:
 				# the rest is not mapped by file ? this is bss
-				self.layout.append(SegmentLoader.layout_item_anon(p_f_end, p_end - p_f_end, p.p_flags))
+				self.layout.append(SegmentLoader.layout_item_anon(addr_f_end, addr_end - addr_f_end, p.p_flags))
 
-			page = p_end
+			addr = addr_end
 
 		print self.layout
 
@@ -129,7 +129,7 @@ class SegmentLoader:
 			if l['type'] == 'mmaped':
 				ret = SegmentLoader.mmap(addr, l['length'], l['prot'],
 					SegmentLoader.MAP_PRIVATE | SegmentLoader.MAP_FIXED, self.fd,
-					mmap.PAGESIZE * SegmentLoader.down2page(l['segment'].p_offset))
+					SegmentLoader.down2page(l['segment'].p_offset))
 				assert ret == addr
 			elif l['type'] == 'unmapped':
 				ret = SegmentLoader.mprotect(addr, l['length'], l['prot'])
@@ -142,8 +142,8 @@ class SegmentLoader:
 				raise Exception("oops")
 
 	def process_gnu_relro(self, p):
-		addr = SegmentLoader.down2page(p.p_vaddr) * mmap.PAGESIZE
-		sz = SegmentLoader.up2page(p.p_vaddr + p.p_memsz) * mmap.PAGESIZE - addr
+		addr = SegmentLoader.down2page(p.p_vaddr)
+		sz = SegmentLoader.up2page(p.p_vaddr + p.p_memsz) - addr
 		ret = SegmentLoader.mprotect(self.base + addr, sz, SegmentLoader.PROT_READ)
 		assert ret == 0
 
