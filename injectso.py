@@ -6,11 +6,19 @@ import gdb
 	- no TLS support
 	- only RTLD_NOW
 	- no support for __attribute__((constructor)) and __attribute__((destructor))
+	- no dependant libraries get loaded
 """
 
 import os, mmap, cffi
 
-class SegmentLoader:
+class DynamicLoader:
+
+	def __init__(self):
+		pass
+
+	def 
+
+class SegmentMapper:
 
 	# from elf.h
 	PF_X           = (1 << 0) # Segment is executable
@@ -19,6 +27,7 @@ class SegmentLoader:
 
 	PT_LOAD        = 1 # Loadable program segment
 	PT_DYNAMIC     = 2 # Dynamic linking information
+	PT_TLS         = 7 # Thread-local storage segment
 	PT_GNU_RELRO   = 0x6474e552 # Read-only after relocation
 
 	# from mman.h
@@ -42,12 +51,12 @@ class SegmentLoader:
 	@staticmethod
 	def _flags2prot(v):
 		ret = 0
-		if 0 != (v & SegmentLoader.PF_X):
-			ret |= SegmentLoader.PROT_EXEC
-		if 0 != (v & SegmentLoader.PF_W):
-			ret |= SegmentLoader.PROT_WRITE
-		if 0 != (v & SegmentLoader.PF_R):
-			ret |= SegmentLoader.PROT_READ
+		if 0 != (v & SegmentMapper.PF_X):
+			ret |= SegmentMapper.PROT_EXEC
+		if 0 != (v & SegmentMapper.PF_W):
+			ret |= SegmentMapper.PROT_WRITE
+		if 0 != (v & SegmentMapper.PF_R):
+			ret |= SegmentMapper.PROT_READ
 		return ret
 
 	@staticmethod
@@ -60,15 +69,15 @@ class SegmentLoader:
 
 	@staticmethod
 	def _layout_item_unmmapped(s, l):
-		return {"type": "unmmapped", "start": s, "length": l, "prot": SegmentLoader.PROT_NONE}
+		return {"type": "unmmapped", "start": s, "length": l, "prot": SegmentMapper.PROT_NONE}
 
 	@staticmethod
 	def _layout_item_mmaped(p, s, l):
-		return {"type": "mmaped", "start": s, "length": l, "segment": p, "prot": SegmentLoader._flags2prot(p.p_flags)}
+		return {"type": "mmaped", "start": s, "length": l, "segment": p, "prot": SegmentMapper._flags2prot(p.p_flags)}
 
 	@staticmethod
 	def _layout_item_anon(s, l, flags):
-		return {"type": "anon", "start": s, "length": l, "prot": SegmentLoader._flags2prot(flags)}
+		return {"type": "anon", "start": s, "length": l, "prot": SegmentMapper._flags2prot(flags)}
 
 	def add_segment(self, p):
 		if (p.p_vaddr & (mmap.PAGESIZE - 1)) != (p.p_offset & (mmap.PAGESIZE - 1)):
@@ -84,25 +93,26 @@ class SegmentLoader:
 				ret = p
 		return ret
 
-	def _create_layout(self):
+	def create_layout(self):
 		self.mmap_sz = max(map(lambda p: p.p_vaddr + p.p_memsz, self.segments))
-		end_addr = SegmentLoader._up2page(self.mmap_sz)
+		end_addr = SegmentMapper._up2page(self.mmap_sz)
 		addr = 0
 		while addr < end_addr:
 			p = self._find_equal_or_greater(addr)
-			addr_start = SegmentLoader._down2page(p.p_vaddr)
-			addr_end = SegmentLoader._up2page(p.p_vaddr + p.p_memsz)
-			addr_f_end = SegmentLoader._up2page(p.p_vaddr + p.p_filesz)
+			assert p is not None
+			addr_start = SegmentMapper._down2page(p.p_vaddr)
+			addr_end = SegmentMapper._up2page(p.p_vaddr + p.p_memsz)
+			addr_f_end = SegmentMapper._up2page(p.p_vaddr + p.p_filesz)
 
 			if addr < addr_start:
 				# hole in virtual addresses ? insert some unmmapped memory
-				self.layout.append(SegmentLoader._layout_item_unmmapped(addr, addr_start - addr))
+				self.layout.append(SegmentMapper._layout_item_unmmapped(addr, addr_start - addr))
 
-			self.layout.append(SegmentLoader._layout_item_mmaped(p, addr_start, addr_f_end - addr_start))
+			self.layout.append(SegmentMapper._layout_item_mmaped(p, addr_start, addr_f_end - addr_start))
 
 			if addr_f_end < addr_end:
 				# the rest is not mapped by file ? this is bss
-				self.layout.append(SegmentLoader._layout_item_anon(addr_f_end, addr_end - addr_f_end, p.p_flags))
+				self.layout.append(SegmentMapper._layout_item_anon(addr_f_end, addr_end - addr_f_end, p.p_flags))
 
 			addr = addr_end
 
@@ -110,7 +120,7 @@ class SegmentLoader:
 
 	@staticmethod
 	def _mmap(addr, sz, prot, flags, fd, offset):
-		return long(gdb.parse_and_eval("$mmap()(%lu, %lu, %u, %u, %u, %lu)" % (
+		return long(gdb.parse_and_eval("((void *(*)(void *, size_t, int, int, int, long))mmap)(%lu, %lu, %u, %u, %u, %lu)" % (
 			addr, sz, prot, flags, fd, offset)))
 
 	@staticmethod
@@ -118,99 +128,175 @@ class SegmentLoader:
 		return int(gdb.parse_and_eval("mprotect(%lu, %lu, %u)" % (addr, sz, prot)))
 
 	def mmap_file(self):
-		self._create_layout()
+		self.create_layout()
 		head = self.layout[0]
 		assert head['type'] == 'mmaped'
 		assert head['segment'].p_offset == 0
-		ret = SegmentLoader._mmap(0, self.mmap_sz, head['prot'], SegmentLoader.MAP_PRIVATE, self.fd, head['segment'].p_offset)
+		ret = SegmentMapper._mmap(0, self.mmap_sz, head['prot'], SegmentMapper.MAP_PRIVATE, self.fd, head['segment'].p_offset)
 		self.base = long(ret)
 		for l in self.layout[1:]:
 			addr = self.base + l['start']
 			if l['type'] == 'mmaped':
-				ret = SegmentLoader._mmap(addr, l['length'], l['prot'],
-					SegmentLoader.MAP_PRIVATE | SegmentLoader.MAP_FIXED, self.fd,
-					SegmentLoader._down2page(l['segment'].p_offset))
+				ret = SegmentMapper._mmap(addr, l['length'], l['prot'],
+					SegmentMapper.MAP_PRIVATE | SegmentMapper.MAP_FIXED, self.fd,
+					SegmentMapper._down2page(l['segment'].p_offset))
 				assert ret == addr
 			elif l['type'] == 'unmmapped':
-				ret = SegmentLoader._mprotect(addr, l['length'], l['prot'])
+				ret = SegmentMapper._mprotect(addr, l['length'], l['prot'])
 				assert ret == 0
 			elif l['type'] == 'anon':
-				ret = SegmentLoader._mmap(addr, l['length'], l['prot'],
-					SegmentLoader.MAP_PRIVATE | SegmentLoader.MAP_FIXED | SegmentLoader.MAP_ANONYMOUS, -1, 0)
+				ret = SegmentMapper._mmap(addr, l['length'], l['prot'],
+					SegmentMapper.MAP_PRIVATE | SegmentMapper.MAP_FIXED | SegmentMapper.MAP_ANONYMOUS, -1, 0)
 				assert ret == addr
 			else:
 				raise Exception("oops")
 
 	def process_gnu_relro(self, p):
-		addr = SegmentLoader._down2page(p.p_vaddr)
-		sz = SegmentLoader._up2page(p.p_vaddr + p.p_memsz) - addr
-		ret = SegmentLoader._mprotect(self.base + addr, sz, SegmentLoader.PROT_READ)
+		addr = SegmentMapper._down2page(p.p_vaddr)
+		sz = SegmentMapper._up2page(p.p_vaddr + p.p_memsz) - addr
+		ret = SegmentMapper._mprotect(self.base + addr, sz, SegmentMapper.PROT_READ)
 		assert ret == 0
 
 class ElfLoader:
 
-	def __init__(self, mh, i_fd, size):
-		self.mh = mh
-		self.sl = SegmentLoader(i_fd)
+	def __init__(self, filename):
+		fd = os.open(filename, os.O_RDONLY)
+		s = os.fstat(fd)
+		self.filename = filename
+		self.size = s.st_size
+		self.mh = mmap.mmap(fd, s.st_size, mmap.MAP_PRIVATE, mmap.PROT_READ)
+		os.close(fd)
 		self.ffi = cffi.FFI()
 		self.ffi.cdef(elf_cdefs)
-		self.size = size
+		self.elf_hdr = self._read("Elf64_Ehdr", 0)
+		sh_str = self._read("Elf64_Shdr", self.elf_hdr.e_shoff + self.elf_hdr.e_shstrndx * self.ffi.sizeof("Elf64_Shdr"))
+		self.strtab = sh_str.sh_offset
+
+	def _strz(self, offset):
+		ret = ''
+		self.mh.seek(self.strtab + offset)
+		while True:
+			ch = self.mh.read(1)
+			if ch == "\0":
+				return ret
+			ret += ch
 
 	def _read(self, type, offset):
 		sz = self.ffi.sizeof(type)
 		self.mh.seek(offset)
+		assert offset + sz <= self.size
 		b = self.mh.read(sz)
 		ret = self.ffi.new(type + "*")
 		(self.ffi.buffer(ret))[:] = b
 		return ret
 
+	def _all_phdrs(self):
+		for ph in range(self.elf_hdr.e_phnum):
+			phdr = self._read("Elf64_Phdr", self.elf_hdr.e_phoff + ph * self.ffi.sizeof("Elf64_Phdr"))
+			yield phdr
+
+	def _all_shdrs(self):
+		for sh in range(self.elf_hdr.e_shnum):
+			shdr = self._read("Elf64_Shdr", self.elf_hdr.e_shoff + sh * self.ffi.sizeof("Elf64_Shdr"))
+			yield shdr
+
 	def load_so(self):
+		i_fd = int(gdb.parse_and_eval("open(\"%s\", 0)" % self.filename))
+		assert i_fd >= 0
+		self.sl = SegmentMapper(i_fd)
 		gnu_relro = None
 
-		elf_hdr = self._read("Elf64_Ehdr", 0)
-
-		for ph in range(elf_hdr.e_phnum):
-			phdr = self._read("Elf64_Phdr", elf_hdr.e_phoff + ph * self.ffi.sizeof("Elf64_Phdr"))
-			if phdr.p_type == SegmentLoader.PT_LOAD:
-				self.sl.add_segment(phdr)
-			elif phdr.p_type == SegmentLoader.PT_GNU_RELRO:
+		for phdr in self._all_phdrs():
+			if phdr.p_type == SegmentMapper.PT_LOAD:
+				self.sm.add_segment(phdr)
+			elif phdr.p_type == SegmentMapper.PT_GNU_RELRO:
 				gnu_relro = phdr
+			elif phdr.p_type == SegmentMapper.PT_TLS:
+				raise Exception("TLS not supported")
 
-		self.sl.mmap_file()
+		self.sm.mmap_file()
 
+		for shdr in self._all_shdrs():
+			if shdr.sh_type == DynamicLoader.
 		# process relocations 
 
 		if gnu_relro is not None:
-			self.sl.process_gnu_relro(gnu_relro)
+			self.sm.process_gnu_relro(gnu_relro)
 
 		# process symbol resolution
 
-class injectso(gdb.Function):
-	def __init__(self):
-		super(injectso, self).__init__("injectso")
+		assert 0 == int(gdb.parse_and_eval("close(%d)" % i_fd))
 
-	def invoke(self, filename):
-		fd = os.open(filename.string(), os.O_RDONLY)
-		s = os.fstat(fd)
-		i_fd = int(gdb.parse_and_eval("open(\"%s\", 0)" % filename.string()))
-		assert i_fd >= 0
-		mh = mmap.mmap(fd, s.st_size, mmap.MAP_PRIVATE, mmap.PROT_READ)
-		os.close(fd)
-		ElfLoader(mh, i_fd, s.st_size).load_so()
-		assert 0 == gdb.parse_and_eval("close(%d)" % i_fd)
-		mh.close()
-		return 0
+	def mmap_sz(self):
+		self.sl = SegmentMapper(-1)
+		for phdr in self._all_phdrs():
+			if phdr.p_type == SegmentMapper.PT_LOAD:
+				self.sm.add_segment(phdr)
+		self.sm.create_layout()
+		return self.sm._up2page(self.sm.mmap_sz)
+
+class injectso(gdb.Command):
+	def __init__(self):
+		super(injectso, self).__init__("injectso", gdb.COMMAND_USER)
+
+	def invoke(self, filename, from_tty):
+		el = ElfLoader(filename).load_so()
 
 injectso()
 
-class gdbmmap(gdb.Function):
+class dumpso(gdb.Command):
 	def __init__(self):
-		super(gdbmmap, self).__init__("mmap")
+		super(dumpso, self).__init__("dumpso", gdb.COMMAND_USER)
 
-	def invoke(self):
-		return gdb.parse_and_eval("(void *(*)(void *, size_t, int, int, int, long))mmap")
+	def invoke(self, args, from_tty):
+		soname, outname = args.split()
+		el = ElfLoader(soname)
+		mmap_sz = el.mmap_sz()
+		print hex(mmap_sz)
+		i_proc = gdb.execute('i proc', to_string=True)
+		pid = int(i_proc.split("\n")[0].split()[1])
+		base = None
 
-gdbmmap()
+		sections = [ sh for sh in el._all_shdrs() ]
+
+		def dump(out, addr, sz, data):
+			def dump_line(addr, data):
+				a = 0
+				for s in sections:
+					if s.sh_addr > 0:
+						if base + s.sh_addr >= addr and base + s.sh_addr < addr + 16:
+							out.write(" > %x: %s\n" % (base + s.sh_addr, el._strz(s.sh_name)))
+				out.write("%x " % addr)
+				for i1 in range(2):
+					for i2 in range(8):
+						out.write("%02x " % ord(data[a]))
+						a += 1
+					out.write(" ")
+				out.write("\n")
+			while sz > 0:
+				dump_line(addr, data)
+				addr += 16
+				sz -= 16
+				data = data[16:]
+
+		with open(outname, 'w+') as out:
+			with open('/proc/%u/maps' % pid) as maps:
+				with open('/proc/%u/mem' % pid) as mem:
+					for line in maps.xreadlines():
+						line = line.rstrip()
+						if base is None and line.endswith('/' + soname):
+							base = int(line.split()[0].split('-')[0], 16)
+						if base is not None:
+							ar, p = line.split(' ', 2)[:2]
+							af, at = ar.split('-')
+							af = int(af, 16)
+							at = int(at, 16)
+							if af >= base and at <= base + mmap_sz and p != '---p':
+								print "dumping", ar, p
+								os.lseek(mem.fileno(), af, os.SEEK_SET)
+								data = os.read(mem.fileno(), at - af)
+								dump(out, af, at - af, data)
+dumpso()
 
 elf_cdefs = """
 		/* Type for a 16-bit quantity.  */
@@ -265,5 +351,19 @@ elf_cdefs = """
 		  Elf64_Xword	p_memsz;		/* Segment size in memory */
 		  Elf64_Xword	p_align;		/* Segment alignment */
 		} Elf64_Phdr;
+
+		typedef struct
+		{
+		  Elf64_Word	sh_name;		/* Section name (string tbl index) */
+		  Elf64_Word	sh_type;		/* Section type */
+		  Elf64_Xword	sh_flags;		/* Section flags */
+		  Elf64_Addr	sh_addr;		/* Section virtual addr at execution */
+		  Elf64_Off	sh_offset;		/* Section file offset */
+		  Elf64_Xword	sh_size;		/* Section size in bytes */
+		  Elf64_Word	sh_link;		/* Link to another section */
+		  Elf64_Word	sh_info;		/* Additional section information */
+		  Elf64_Xword	sh_addralign;		/* Section alignment */
+		  Elf64_Xword	sh_entsize;		/* Entry size if section holds table */
+		} Elf64_Shdr;
 	"""
 
