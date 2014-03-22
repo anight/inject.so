@@ -1,6 +1,4 @@
 
-import gdb
-
 """
 	limitations:
 	- no TLS support
@@ -8,6 +6,8 @@ import gdb
 	- no support for __attribute__((constructor)) and __attribute__((destructor))
 	- no dependant libraries get loaded
 """
+
+import gdb
 
 import os, mmap, cffi
 
@@ -72,8 +72,8 @@ class SegmentMapper:
 		return {"type": "unmmapped", "start": s, "length": l, "prot": SegmentMapper.PROT_NONE}
 
 	@staticmethod
-	def _layout_item_mmaped(p, s, l):
-		return {"type": "mmaped", "start": s, "length": l, "segment": p, "prot": SegmentMapper._flags2prot(p.p_flags)}
+	def _layout_item_mmaped(p, s, l, bzero):
+		return {"type": "mmaped", "start": s, "length": l, "segment": p, "prot": SegmentMapper._flags2prot(p.p_flags), "bzero": bzero}
 
 	@staticmethod
 	def _layout_item_anon(s, l, flags):
@@ -108,7 +108,11 @@ class SegmentMapper:
 				# hole in virtual addresses ? insert some unmmapped memory
 				self.layout.append(SegmentMapper._layout_item_unmmapped(addr, addr_start - addr))
 
-			self.layout.append(SegmentMapper._layout_item_mmaped(p, addr_start, addr_f_end - addr_start))
+			bzero = None
+			if p.p_memsz > p.p_filesz:
+				bzero = (p.p_vaddr + p.p_filesz, addr_f_end)
+
+			self.layout.append(SegmentMapper._layout_item_mmaped(p, addr_start, addr_f_end - addr_start, bzero))
 
 			if addr_f_end < addr_end:
 				# the rest is not mapped by file ? this is bss
@@ -139,6 +143,9 @@ class SegmentMapper:
 					SegmentMapper.MAP_PRIVATE | SegmentMapper.MAP_FIXED, self.fd,
 					SegmentMapper._down2page(l['segment'].p_offset))
 				assert ret == addr
+				if l['bzero'] is not None:
+					for bzero_addr in range(*l['bzero']):
+						gdb.execute("set * (char *) %lu = 0" % (self.base + bzero_addr))
 			elif l['type'] == 'unmmapped':
 				ret = SegmentMapper._mprotect(addr, l['length'], l['prot'])
 				assert ret == 0
