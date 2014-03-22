@@ -11,24 +11,24 @@ import gdb
 
 import os, mmap, cffi
 
-class DynamicLoader:
 
-	def __init__(self):
-		pass
 
-	def 
+class Relocator:
+
+	def __init__(self, el):
+		self.el = el
+
+	def relocate(self):
+		add_addr = (Elf.DT_HASH, Elf.DT_GNU_HASH, Elf.DT_STRTAB, Elf.DT_SYMTAB,
+			Elf.DT_PLTGOT, Elf.DT_JMPREL, Elf.DT_RELA, Elf.DT_VERSYM)
+		for no, de in self.el._all_dyn_entries():
+			if de.d_tag in add_addr:
+				address = self.el.sm.base + self.el.dyn_section.sh_addr + \
+					no * self.el.dyn_section.sh_entsize + \
+					self.el.ffi.offsetof("Elf64_Dyn", "d_un")
+				gdb.execute("set * (long *) %lu = %lu" % (address, de.d_un.d_val + self.el.sm.base))
 
 class SegmentMapper:
-
-	# from elf.h
-	PF_X           = (1 << 0) # Segment is executable
-	PF_W           = (1 << 1) # Segment is writable
-	PF_R           = (1 << 2) # Segment is readable
-
-	PT_LOAD        = 1 # Loadable program segment
-	PT_DYNAMIC     = 2 # Dynamic linking information
-	PT_TLS         = 7 # Thread-local storage segment
-	PT_GNU_RELRO   = 0x6474e552 # Read-only after relocation
 
 	# from mman.h
 	PROT_READ      = 0x1 # page can be read
@@ -43,7 +43,7 @@ class SegmentMapper:
 
 	def __init__(self, fd):
 		self.fd = fd
-		self.base = 0
+		self.base = None
 		self.mmap_sz = None
 		self.segments = []
 		self.layout = []
@@ -51,11 +51,11 @@ class SegmentMapper:
 	@staticmethod
 	def _flags2prot(v):
 		ret = 0
-		if 0 != (v & SegmentMapper.PF_X):
+		if 0 != (v & Elf.PF_X):
 			ret |= SegmentMapper.PROT_EXEC
-		if 0 != (v & SegmentMapper.PF_W):
+		if 0 != (v & Elf.PF_W):
 			ret |= SegmentMapper.PROT_WRITE
-		if 0 != (v & SegmentMapper.PF_R):
+		if 0 != (v & Elf.PF_R):
 			ret |= SegmentMapper.PROT_READ
 		return ret
 
@@ -116,8 +116,6 @@ class SegmentMapper:
 
 			addr = addr_end
 
-		print self.layout
-
 	@staticmethod
 	def _mmap(addr, sz, prot, flags, fd, offset):
 		return long(gdb.parse_and_eval("((void *(*)(void *, size_t, int, int, int, long))mmap)(%lu, %lu, %u, %u, %u, %lu)" % (
@@ -167,10 +165,11 @@ class ElfLoader:
 		self.mh = mmap.mmap(fd, s.st_size, mmap.MAP_PRIVATE, mmap.PROT_READ)
 		os.close(fd)
 		self.ffi = cffi.FFI()
-		self.ffi.cdef(elf_cdefs)
+		self.ffi.cdef(Elf.cdefs)
 		self.elf_hdr = self._read("Elf64_Ehdr", 0)
 		sh_str = self._read("Elf64_Shdr", self.elf_hdr.e_shoff + self.elf_hdr.e_shstrndx * self.ffi.sizeof("Elf64_Shdr"))
 		self.strtab = sh_str.sh_offset
+		self.dyn_section = None
 
 	def _strz(self, offset):
 		ret = ''
@@ -200,25 +199,36 @@ class ElfLoader:
 			shdr = self._read("Elf64_Shdr", self.elf_hdr.e_shoff + sh * self.ffi.sizeof("Elf64_Shdr"))
 			yield shdr
 
-	def load_so(self):
+	def _all_dyn_entries(self):
+		for de in range(self.dyn_section.sh_size / self.dyn_section.sh_entsize):
+			dyn = self._read("Elf64_Dyn", self.dyn_section.sh_offset + de * self.ffi.sizeof("Elf64_Dyn"))
+			if dyn.d_tag == 0:
+				break
+			yield de, dyn
+
+	def injectso(self):
 		i_fd = int(gdb.parse_and_eval("open(\"%s\", 0)" % self.filename))
 		assert i_fd >= 0
-		self.sl = SegmentMapper(i_fd)
+		self.sm = SegmentMapper(i_fd)
 		gnu_relro = None
 
 		for phdr in self._all_phdrs():
-			if phdr.p_type == SegmentMapper.PT_LOAD:
+			if phdr.p_type == Elf.PT_LOAD:
 				self.sm.add_segment(phdr)
-			elif phdr.p_type == SegmentMapper.PT_GNU_RELRO:
+			elif phdr.p_type == Elf.PT_GNU_RELRO:
 				gnu_relro = phdr
-			elif phdr.p_type == SegmentMapper.PT_TLS:
+			elif phdr.p_type == Elf.PT_TLS:
 				raise Exception("TLS not supported")
 
 		self.sm.mmap_file()
 
+		self.r = Relocator(self)
+
 		for shdr in self._all_shdrs():
-			if shdr.sh_type == DynamicLoader.
-		# process relocations 
+			if shdr.sh_type == Elf.SHT_DYNAMIC:
+				self.dyn_section = shdr
+
+		self.r.relocate()
 
 		if gnu_relro is not None:
 			self.sm.process_gnu_relro(gnu_relro)
@@ -228,9 +238,9 @@ class ElfLoader:
 		assert 0 == int(gdb.parse_and_eval("close(%d)" % i_fd))
 
 	def mmap_sz(self):
-		self.sl = SegmentMapper(-1)
+		self.sm = SegmentMapper(-1)
 		for phdr in self._all_phdrs():
-			if phdr.p_type == SegmentMapper.PT_LOAD:
+			if phdr.p_type == Elf.PT_LOAD:
 				self.sm.add_segment(phdr)
 		self.sm.create_layout()
 		return self.sm._up2page(self.sm.mmap_sz)
@@ -240,7 +250,7 @@ class injectso(gdb.Command):
 		super(injectso, self).__init__("injectso", gdb.COMMAND_USER)
 
 	def invoke(self, filename, from_tty):
-		el = ElfLoader(filename).load_so()
+		el = ElfLoader(filename).injectso()
 
 injectso()
 
@@ -252,7 +262,6 @@ class dumpso(gdb.Command):
 		soname, outname = args.split()
 		el = ElfLoader(soname)
 		mmap_sz = el.mmap_sz()
-		print hex(mmap_sz)
 		i_proc = gdb.execute('i proc', to_string=True)
 		pid = int(i_proc.split("\n")[0].split()[1])
 		base = None
@@ -267,11 +276,10 @@ class dumpso(gdb.Command):
 						if base + s.sh_addr >= addr and base + s.sh_addr < addr + 16:
 							out.write(" > %x: %s\n" % (base + s.sh_addr, el._strz(s.sh_name)))
 				out.write("%x " % addr)
-				for i1 in range(2):
-					for i2 in range(8):
-						out.write("%02x " % ord(data[a]))
+				for i1 in range(4):
+					for i2 in range(4):
+						out.write("%c%02x" % ((' ', '|')[i2 == 0], ord(data[a])))
 						a += 1
-					out.write(" ")
 				out.write("\n")
 			while sz > 0:
 				dump_line(addr, data)
@@ -298,7 +306,31 @@ class dumpso(gdb.Command):
 								dump(out, af, at - af, data)
 dumpso()
 
-elf_cdefs = """
+class Elf:
+
+	# from elf.h
+	PF_X           = (1 << 0) # Segment is executable
+	PF_W           = (1 << 1) # Segment is writable
+	PF_R           = (1 << 2) # Segment is readable
+
+	PT_LOAD        = 1 # Loadable program segment
+	PT_DYNAMIC     = 2 # Dynamic linking information
+	PT_TLS         = 7 # Thread-local storage segment
+	PT_GNU_RELRO   = 0x6474e552 # Read-only after relocation
+
+	SHT_DYNAMIC    = 6 # Dynamic linking information
+
+	DT_PLTGOT      = 3 # Processor defined value
+	DT_HASH        = 4 # Address of symbol hash table
+	DT_STRTAB      = 5 # Address of string table
+	DT_SYMTAB      = 6 # Address of symbol table
+	DT_RELA        = 7 # Address of Rela relocs
+	DT_REL         = 17 # Address of Rel relocs
+	DT_JMPREL      = 23 # Address of PLT relocs
+	DT_GNU_HASH    = 0x6ffffef5 # GNU-style hash table.
+	DT_VERSYM      = 0x6ffffff0 # some stuff
+
+	cdefs = """
 		/* Type for a 16-bit quantity.  */
 		typedef uint16_t Elf64_Half;
 
@@ -365,5 +397,15 @@ elf_cdefs = """
 		  Elf64_Xword	sh_addralign;		/* Section alignment */
 		  Elf64_Xword	sh_entsize;		/* Entry size if section holds table */
 		} Elf64_Shdr;
+
+		typedef struct
+		{
+		  Elf64_Sxword	d_tag;			/* Dynamic entry type */
+		  union
+		    {
+		      Elf64_Xword d_val;		/* Integer value */
+		      Elf64_Addr d_ptr;			/* Address value */
+		    } d_un;
+		} Elf64_Dyn;
 	"""
 
